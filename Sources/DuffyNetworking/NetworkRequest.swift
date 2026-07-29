@@ -7,16 +7,12 @@ import HTTPTypes
 import HTTPTypesFoundation
 
 public protocol HTTPRequestDataProvider: Sendable {
+    /// Performs a request using the supplied body and effective environment values.
     func data(
         for request: HTTPRequest,
+        body: Data?,
         environment: HTTPRequestEnvironmentValues,
-    ) async throws -> (data: Data, response: HTTPResponse)
-
-    func upload(
-        data: Data,
-        for request: HTTPRequest,
-        environment: HTTPRequestEnvironmentValues,
-    ) async throws -> (data: Data, response: HTTPResponse)
+    ) async throws -> HTTPResponseSnapshot
 }
 
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
@@ -36,45 +32,28 @@ public struct URLSessionHTTPRequestDataProvider: HTTPRequestDataProvider, Sendab
 
     public func data(
         for request: HTTPRequest,
+        body: Data?,
         environment: HTTPRequestEnvironmentValues,
-    ) async throws -> (data: Data, response: HTTPResponse) {
+    ) async throws -> HTTPResponseSnapshot {
         guard var urlRequest = URLRequest(httpRequest: request) else {
             throw HTTPTypeConversionError.failedToConvertHTTPRequestToURLRequest
         }
 
-        if let cachePolicy = environment[URLRequestCachePolicyKey.self] {
+        if let cachePolicy = environment.urlRequestCachePolicy {
             urlRequest.cachePolicy = cachePolicy
         }
 
-        let (data, urlResponse) = try await urlSession.data(for: urlRequest)
+        let (data, urlResponse) = if let body {
+            try await urlSession.upload(for: urlRequest, from: body)
+        } else {
+            try await urlSession.data(for: urlRequest)
+        }
 
         guard let response = (urlResponse as? HTTPURLResponse)?.httpResponse else {
             throw HTTPTypeConversionError.failedToConvertURLResponseToHTTPResponse
         }
 
-        return (data, response)
-    }
-
-    public func upload(
-        data: Data,
-        for request: HTTPRequest,
-        environment: HTTPRequestEnvironmentValues,
-    ) async throws -> (data: Data, response: HTTPResponse) {
-        guard var urlRequest = URLRequest(httpRequest: request) else {
-            throw HTTPTypeConversionError.failedToConvertHTTPRequestToURLRequest
-        }
-
-        if let cachePolicy = environment[URLRequestCachePolicyKey.self] {
-            urlRequest.cachePolicy = cachePolicy
-        }
-
-        let (data, urlResponse) = try await urlSession.upload(for: urlRequest, from: data)
-
-        guard let response = (urlResponse as? HTTPURLResponse)?.httpResponse else {
-            throw HTTPTypeConversionError.failedToConvertURLResponseToHTTPResponse
-        }
-
-        return (data, response)
+        return HTTPResponseSnapshot(body: data, response: response)
     }
 }
 
@@ -83,30 +62,17 @@ private enum HTTPTypeConversionError: Error {
     case failedToConvertURLResponseToHTTPResponse
 }
 
-public enum CachePolicy: Codable, Hashable, Sendable {
-    case useProtocolCachePolicy
-
-    case reloadIgnoringLocalCacheData
-
-    case reloadIgnoringLocalAndRemoteCacheData
-
-    case reloadIgnoringCacheData
-
-    case returnCacheDataElseLoad
-
-    case returnCacheDataDontLoad
-
-    case reloadRevalidatingCacheData
-}
-
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 extension URLSessionHTTPRequestDataProvider {
     public static var shared: URLSessionHTTPRequestDataProvider {
-        URLSessionHTTPRequestDataProvider(urlSession: .shared)
+        URLSessionHTTPRequestDataProvider(
+            urlSession: .shared,
+            invalidateOnDeinit: false,
+        )
     }
 }
 
-private final class URLSessionInvalidator: @unchecked Sendable {
+private final class URLSessionInvalidator: Sendable {
     let urlSession: URLSession
 
     private let invalidateOnDeinit: Bool
@@ -124,19 +90,53 @@ private final class URLSessionInvalidator: @unchecked Sendable {
     }
 }
 
-public struct HTTPRequestPerformerError<ResponseBody>: Error {
-    public let underlyingError: Error
+public struct HTTPRequestSnapshot: Hashable, Sendable {
+    /// The body produced by the request modifiers.
+    public let body: Data?
+
+    /// The request produced by the request modifiers.
+    public let request: HTTPRequest
+
+    public init(body: Data?, request: HTTPRequest) {
+        self.body = body
+        self.request = request
+    }
+}
+
+public struct HTTPResponseSnapshot: Hashable, Sendable {
+    /// The raw response body.
+    public let body: Data
+
+    /// The HTTP response metadata.
+    public let response: HTTPResponse
+
+    public init(body: Data, response: HTTPResponse) {
+        self.body = body
+        self.response = response
+    }
+}
+
+public struct HTTPRequestPerformerError<ResponseBody: Sendable>: Error {
+    public let underlyingError: any Error
 
     public let requestConfiguration: HTTPRequestConfiguration<ResponseBody>
 
-    public let httpRequest: (Data?, HTTPRequest)?
+    public let request: HTTPRequestSnapshot?
 
-    public let response: (Data?, HTTPResponse)?
+    public let response: HTTPResponseSnapshot?
 }
 
-private struct UnknownMappingError<ResponseBody>: LocalizedError {
-    var errorDescription: String? {
-        "Cannot map from Data to \(ResponseBody.self). Don't use a request returned by `HTTPRequestPerformer.buildAndPerformRequest(baseRequest:requestBuilder:)`."
+public struct HTTPRequestRecoveryError<ResponseBody: Sendable>: Error {
+    public let requestError: HTTPRequestPerformerError<ResponseBody>
+
+    public let underlyingError: any Error
+
+    public init(
+        requestError: HTTPRequestPerformerError<ResponseBody>,
+        underlyingError: any Error,
+    ) {
+        self.requestError = requestError
+        self.underlyingError = underlyingError
     }
 }
 
@@ -144,62 +144,28 @@ private struct UnknownMappingError<ResponseBody>: LocalizedError {
 public struct HTTPRequestPerformer: Sendable {
     private let dataProvider: HTTPRequestDataProvider
 
-    public let environment: HTTPRequestEnvironmentValues
+    private let environmentValues: HTTPRequestEnvironmentValues
 
-    public init(dataProvider: HTTPRequestDataProvider) {
+    public init(
+        dataProvider: HTTPRequestDataProvider,
+        environmentValues: HTTPRequestEnvironmentValues = HTTPRequestEnvironmentValues(),
+    ) {
         self.dataProvider = dataProvider
-        environment = HTTPRequestEnvironmentValues()
+        self.environmentValues = environmentValues
     }
 
-    private init(dataProvider: HTTPRequestDataProvider, environment: HTTPRequestEnvironmentValues) {
-        self.dataProvider = dataProvider
-        self.environment = environment
-    }
-
-    public func buildAndPerformRequest<ResponseBody>(
-        baseRequest: HTTPRequestConfiguration<Data>,
-        requestBuilder: (_ baseRequest: HTTPRequestConfiguration<Data>) throws -> HTTPRequestConfiguration<ResponseBody>,
+    /// Performs a request after merging the performer's environment defaults with the request's
+    /// overrides. Request values take precedence, and the supplied configuration is not mutated.
+    public func perform<ResponseBody: Sendable>(
+        _ request: HTTPRequestConfiguration<ResponseBody>,
     ) async throws(HTTPRequestPerformerError<ResponseBody>) -> ResponseBody {
-        do {
-            let request = try requestBuilder(baseRequest)
-            return try await performRequest(request: request)
-        } catch let error as HTTPRequestPerformerError<ResponseBody> {
-            throw error
-        } catch {
-            throw HTTPRequestPerformerError(
-                underlyingError: error,
-                requestConfiguration: baseRequest.mapResponseBody({ _, _, _, _ in
-                    assertionFailure("Attempted to map the response of a request configuration that was created when a request builder threw an error.")
-                    throw UnknownMappingError<ResponseBody>()
-                }),
-                httpRequest: nil,
-                response: nil,
-            )
-        }
-    }
+        let effectiveEnvironment = environmentValues.merging(
+            request.environmentValues,
+        )
+        let request = request.replacingEnvironmentValues(
+            with: effectiveEnvironment,
+        )
 
-    public func buildAndPerformRequest(
-        baseRequest: HTTPRequestConfiguration<Data>,
-        requestBuilder: (_ baseRequest: HTTPRequestConfiguration<Data>) throws -> HTTPRequestConfiguration<Data>,
-    ) async throws(HTTPRequestPerformerError<Data>) -> Data {
-        do {
-            let request = try requestBuilder(baseRequest)
-            return try await performRequest(request: request)
-        } catch let error as HTTPRequestPerformerError<Data> {
-            throw error
-        } catch {
-            throw HTTPRequestPerformerError(
-                underlyingError: error,
-                requestConfiguration: baseRequest,
-                httpRequest: nil,
-                response: nil,
-            )
-        }
-    }
-
-    public func performRequest<ResponseBody>(
-        request: HTTPRequestConfiguration<ResponseBody>
-    ) async throws(HTTPRequestPerformerError<ResponseBody>) -> ResponseBody {
         func notifyResponseListenersOfResponse(
             _ response: @autoclosure () -> HTTPRequestPerformResult<ResponseBody>,
         ) {
@@ -214,33 +180,85 @@ public struct HTTPRequestPerformer: Sendable {
         }
 
         func attemptRecovery(
-            underlyingError: Error,
-            httpRequest: (Data?, HTTPRequest)?,
-            response: (Data, HTTPResponse)?
+            underlyingError: any Error,
+            requestSnapshot: HTTPRequestSnapshot?,
+            responseSnapshot: HTTPResponseSnapshot?,
         ) async throws(HTTPRequestPerformerError<ResponseBody>) -> ResponseBody {
-            let error = HTTPRequestPerformerError(
+            let requestError = HTTPRequestPerformerError(
                 underlyingError: underlyingError,
                 requestConfiguration: request,
-                httpRequest: httpRequest,
-                response: response
+                request: requestSnapshot,
+                response: responseSnapshot,
             )
 
-            for errorHandler in request.errorHandlers {
-                if let recoveryAction = await errorHandler.attemptRecovery(from: error) {
-                    notifyResponseListenersOfResponse(.failure(error, recoveryAction))
+            guard !Task.isCancelled, !(underlyingError is CancellationError) else {
+                notifyResponseListenersOfResponse(.failure(requestError, nil))
+                throw requestError
+            }
 
-                    switch recoveryAction {
-                    case .returnResponse(let responseBody):
-                        return responseBody
-                    case .replaceRequest(let newRequest):
-                        return try await performRequest(request: newRequest)
-                    }
+            for errorHandler in request.errorHandlers {
+                do {
+                    try Task.checkCancellation()
+                } catch {
+                    let cancellationError = HTTPRequestPerformerError(
+                        underlyingError: error,
+                        requestConfiguration: request,
+                        request: requestSnapshot,
+                        response: responseSnapshot,
+                    )
+                    notifyResponseListenersOfResponse(.failure(cancellationError, nil))
+                    throw cancellationError
+                }
+
+                let recoveryAction: HTTPRequestErrorRecoveryAction<ResponseBody>?
+
+                do {
+                    recoveryAction = try await errorHandler.attemptRecovery(from: requestError)
+                    try Task.checkCancellation()
+                } catch let error as CancellationError {
+                    let cancellationError = HTTPRequestPerformerError(
+                        underlyingError: error,
+                        requestConfiguration: request,
+                        request: requestSnapshot,
+                        response: responseSnapshot,
+                    )
+                    notifyResponseListenersOfResponse(.failure(cancellationError, nil))
+                    throw cancellationError
+                } catch let handlerError {
+                    let recoveryError = HTTPRequestPerformerError(
+                        underlyingError: HTTPRequestRecoveryError(
+                            requestError: requestError,
+                            underlyingError: handlerError,
+                        ),
+                        requestConfiguration: request,
+                        request: requestSnapshot,
+                        response: responseSnapshot,
+                    )
+                    notifyResponseListenersOfResponse(.failure(recoveryError, nil))
+                    throw recoveryError
+                }
+
+                guard let recoveryAction else { continue }
+
+                notifyResponseListenersOfResponse(.failure(requestError, recoveryAction))
+
+                switch recoveryAction {
+                case .returnResponse(let responseBody):
+                    return responseBody
+                case .replaceRequest(let newRequest):
+                    let inheritedEnvironment = request.environmentValues.merging(
+                        newRequest.environmentValues,
+                    )
+                    let inheritedRequest = newRequest.replacingEnvironmentValues(
+                        with: inheritedEnvironment,
+                    )
+                    return try await perform(inheritedRequest)
                 }
             }
 
-            notifyResponseListenersOfResponse(.failure(error, nil))
+            notifyResponseListenersOfResponse(.failure(requestError, nil))
 
-            throw error
+            throw requestError
         }
 
         var httpRequest = request.baseHTTPRequest
@@ -248,49 +266,83 @@ public struct HTTPRequestPerformer: Sendable {
 
         do {
             for modifier in request.requestModifiers {
-                try await modifier.modifyRequest(&httpRequest, body: &requestBody)
+                try await modifier.modifyRequest(
+                    &httpRequest,
+                    body: &requestBody,
+                    environment: effectiveEnvironment,
+                )
+                try Task.checkCancellation()
             }
         } catch {
             return try await attemptRecovery(
                 underlyingError: error,
-                httpRequest: nil,
-                response: nil,
+                requestSnapshot: HTTPRequestSnapshot(
+                    body: requestBody,
+                    request: httpRequest,
+                ),
+                responseSnapshot: nil,
             )
         }
 
-        let responseBody: Data
-        let httpResponse: HTTPResponse
+        let requestSnapshot = HTTPRequestSnapshot(
+            body: requestBody,
+            request: httpRequest,
+        )
+        let responseSnapshot: HTTPResponseSnapshot
 
         do {
-            (responseBody, httpResponse) = try await dataProvider.data(for: httpRequest, environment: environment)
+            responseSnapshot = try await dataProvider.data(
+                for: httpRequest,
+                body: requestBody,
+                environment: effectiveEnvironment,
+            )
+            try Task.checkCancellation()
         } catch {
             return try await attemptRecovery(
                 underlyingError: error,
-                httpRequest: (requestBody, httpRequest),
-                response: nil
+                requestSnapshot: requestSnapshot,
+                responseSnapshot: nil,
             )
         }
 
         do {
+            var validationErrors: [any Error] = []
+
             for validator in request.responseValidators {
-                try await validator.validateResponse((responseBody, httpResponse), to: (requestBody, httpRequest))
+                do {
+                    try Task.checkCancellation()
+                    try await validator.validateResponse(
+                        responseSnapshot,
+                        to: requestSnapshot,
+                        environment: effectiveEnvironment,
+                    )
+                } catch let error as CancellationError {
+                    throw error
+                } catch {
+                    validationErrors.append(error)
+                }
+            }
+
+            if !validationErrors.isEmpty {
+                throw ResponseValidatorErrors(errors: validationErrors)
             }
 
             let modifiedResponseBody = try await request
                 .responseBodyModifier
                 .modifyBody(
-                    responseBody,
-                    request: request.mapResponseBody { body, _, _, _ in body as Any },
-                    httpRequest: httpRequest,
-                    response: httpResponse
+                    responseSnapshot.body,
+                    environment: effectiveEnvironment,
+                    request: requestSnapshot,
+                    response: responseSnapshot,
                 )
+            try Task.checkCancellation()
 
             notifyResponseListenersOfResponse(
                 .success(
                     requestConfiguration: request,
                     responseBody: modifiedResponseBody,
-                    httpRequest: (requestBody, httpRequest),
-                    httpResponse: (responseBody, httpResponse),
+                    request: requestSnapshot,
+                    response: responseSnapshot,
                 ),
             )
 
@@ -298,28 +350,31 @@ public struct HTTPRequestPerformer: Sendable {
         } catch {
             return try await attemptRecovery(
                 underlyingError: error,
-                httpRequest: (requestBody, httpRequest),
-                response: (responseBody, httpResponse),
+                requestSnapshot: requestSnapshot,
+                responseSnapshot: responseSnapshot,
             )
         }
     }
 
     public func environment<V>(
         _ keyPath: WritableKeyPath<HTTPRequestEnvironmentValues, V>,
-        _ value: V
+        _ value: V,
     ) -> HTTPRequestPerformer {
-        var environment = environment
-        environment[keyPath: keyPath] = value
-        return HTTPRequestPerformer(dataProvider: dataProvider, environment: environment)
+        var environmentValues = environmentValues
+        environmentValues[keyPath: keyPath] = value
+        return HTTPRequestPerformer(
+            dataProvider: dataProvider,
+            environmentValues: environmentValues,
+        )
     }
 }
 
-public enum HTTPRequestPerformResult<ResponseBody> {
+public enum HTTPRequestPerformResult<ResponseBody: Sendable>: Sendable {
     case success(
         requestConfiguration: HTTPRequestConfiguration<ResponseBody>,
         responseBody: ResponseBody,
-        httpRequest: (Data?, HTTPRequest),
-        httpResponse: (Data, HTTPResponse),
+        request: HTTPRequestSnapshot,
+        response: HTTPResponseSnapshot,
     )
 
     case failure(
@@ -329,7 +384,7 @@ public enum HTTPRequestPerformResult<ResponseBody> {
 }
 
 /// A type that describes how to construct a HTTP request and how to handle the response.
-public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
+public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     /// The base request the ``requestModifiers`` will modify.
     public let baseHTTPRequest: HTTPRequest
 
@@ -338,12 +393,15 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
     /// These modifiers will be applied in the order they are provided.
     public let requestModifiers: [HTTPRequestModifier]
 
-    /// An array of values that will be notified of the network response, before validation or
-    /// modification. These will always be notified of the response, even if the request fails.
+    /// An array of values that will be notified of the final result of each performance attempt.
+    ///
+    /// Listeners for a result are called sequentially in a background task. Request completion does
+    /// not wait for them, and ordering between results from different requests is not guaranteed.
     public let responseListeners: [HTTPResponseListener]
 
     /// An array of values that can validate the response. All validators will be run, but if any
-    /// validator fails the request will be considered failed.
+    /// validator fails the request will be considered failed. Validators run sequentially in the
+    /// configured order and their errors are collected in a ``ResponseValidatorErrors`` value.
     public let responseValidators: [HTTPResponseValidator]
 
     /// A value that will modify the response's body.
@@ -360,6 +418,10 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
     /// response listener.
     public let errorHandlers: [HTTPRequestPerformerErrorHandler]
 
+    /// Values that override the performer's environment defaults for this request.
+    ///
+    /// Errors and listener results contain an execution-local configuration whose values have
+    /// already been merged with the performer defaults.
     public let environmentValues: HTTPRequestEnvironmentValues
 
     public init(
@@ -369,7 +431,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
         responseValidators: [HTTPResponseValidator] = [],
         responseBodyModifier: any HTTPBodyModifier<Data, ResponseBody>,
         errorHandlers: [HTTPRequestPerformerErrorHandler] = [],
-        environmentValues: HTTPRequestEnvironmentValues,
+        environmentValues: HTTPRequestEnvironmentValues = HTTPRequestEnvironmentValues(),
     ) {
         self.baseHTTPRequest = baseHTTPRequest
         self.requestModifiers = requestModifiers
@@ -387,7 +449,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
         responseValidators: [HTTPResponseValidator] = [],
         responseBodyModifier: any HTTPBodyModifier<Data, ResponseBody> = MapHTTPResponseModifier(transform: { body, _, _, _ in body }),
         errorHandlers: [HTTPRequestPerformerErrorHandler] = [],
-        environmentValues: HTTPRequestEnvironmentValues,
+        environmentValues: HTTPRequestEnvironmentValues = HTTPRequestEnvironmentValues(),
     ) where ResponseBody == Data {
         self.baseHTTPRequest = baseHTTPRequest
         self.requestModifiers = requestModifiers
@@ -448,7 +510,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
 
     public func responseBodyModifier<NewResponseBody>(
         _ responseBodyModifier: any HTTPBodyModifier<ResponseBody, NewResponseBody>
-    ) -> HTTPRequestConfiguration<NewResponseBody> {
+    ) -> HTTPRequestConfiguration<NewResponseBody> where NewResponseBody: Sendable {
         let newResponseBodyModifier = self.responseBodyModifier.then(responseBodyModifier)
         return HTTPRequestConfiguration<NewResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
@@ -479,11 +541,25 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
 
     public func environment<V>(
         _ keyPath: WritableKeyPath<HTTPRequestEnvironmentValues, V>,
-        _ value: V
+        _ value: V,
     ) -> Self {
         var environmentValues = environmentValues
         environmentValues[keyPath: keyPath] = value
         return HTTPRequestConfiguration<ResponseBody>(
+            baseHTTPRequest: baseHTTPRequest,
+            requestModifiers: requestModifiers,
+            responseListeners: responseListeners,
+            responseValidators: responseValidators,
+            responseBodyModifier: responseBodyModifier,
+            errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
+        )
+    }
+
+    internal func replacingEnvironmentValues(
+        with environmentValues: HTTPRequestEnvironmentValues,
+    ) -> Self {
+        HTTPRequestConfiguration<ResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
             responseListeners: responseListeners,
@@ -517,6 +593,14 @@ public struct HTTPRequestEnvironmentValues: Sendable {
             storage[ObjectIdentifier(key)] = value
         }
     }
+
+    /// Returns a copy containing these values overlaid with explicitly stored values from
+    /// `overrides`. Values from `overrides` take precedence.
+    internal func merging(_ overrides: HTTPRequestEnvironmentValues) -> HTTPRequestEnvironmentValues {
+        var values = self
+        values.storage.merge(overrides.storage) { _, override in override }
+        return values
+    }
 }
 
 public protocol HTTPRequestEnvironmentKey {
@@ -529,27 +613,56 @@ private enum URLRequestCachePolicyKey: HTTPRequestEnvironmentKey {
     static let defaultValue: URLRequest.CachePolicy? = nil
 }
 
+extension HTTPRequestEnvironmentValues {
+    public var urlRequestCachePolicy: URLRequest.CachePolicy? {
+        get { self[URLRequestCachePolicyKey.self] }
+        set { self[URLRequestCachePolicyKey.self] = newValue }
+    }
+}
+
 public protocol HTTPRequestModifier: Sendable {
-    func modifyRequest(_ request: inout HTTPRequest, body: inout Data?) async throws
+    func modifyRequest(
+        _ request: inout HTTPRequest,
+        body: inout Data?,
+        environment: HTTPRequestEnvironmentValues,
+    ) async throws
 }
 
 public protocol HTTPResponseListener: Sendable {
-    func handleResponse<ResponseBody>(
+    func handleResponse<ResponseBody: Sendable>(
         _ response: HTTPRequestPerformResult<ResponseBody>,
     ) async
 }
 
 public protocol HTTPResponseValidator: Sendable {
-    func validateResponse(_ response: (Data, HTTPResponse), to request: (Data?, HTTPRequest)) async throws
+    func validateResponse(
+        _ response: HTTPResponseSnapshot,
+        to request: HTTPRequestSnapshot,
+        environment: HTTPRequestEnvironmentValues,
+    ) async throws
+}
+
+/// The errors produced by response validators, in validator execution order.
+public struct ResponseValidatorErrors: Error {
+    public let errors: [any Error]
+
+    internal init(errors: [any Error]) {
+        precondition(!errors.isEmpty)
+        self.errors = errors
+    }
 }
 
 public struct HTTPStatusCodeValidator: HTTPResponseValidator {
     public init() {}
 
-    public func validateResponse(_ response: (Data, HTTPResponse), to request: (Data?, HTTPRequest)) throws {
-        switch response.1.status.kind {
+    public func validateResponse(
+        _ response: HTTPResponseSnapshot,
+        to request: HTTPRequestSnapshot,
+        environment: HTTPRequestEnvironmentValues,
+    ) throws {
+        switch response.response.status.kind {
         case .clientError, .serverError, .invalid:
-            throw HTTPStatusError(statusCode: response.1.status)
+            throw HTTPStatusError(status: response.response.status)
         case .informational, .successful, .redirection:
             break
         }
@@ -557,23 +670,32 @@ public struct HTTPStatusCodeValidator: HTTPResponseValidator {
 }
 
 public struct HTTPStatusError: LocalizedError {
+    public let status: HTTPResponse.Status
+
     public let errorDescription: String?
+
     public let failureReason: String?
 
-    init(statusCode: HTTPResponse.Status) {
-        errorDescription = "HTTP status code \(statusCode.code)"
-        failureReason = statusCode.reasonPhrase
+    public init(status: HTTPResponse.Status) {
+        self.status = status
+        errorDescription = "HTTP status code \(status.code)"
+        failureReason = status.reasonPhrase
     }
 }
 
 public protocol HTTPRequestPerformerErrorHandler: Sendable {
-    func attemptRecovery<ResponseBody>(
+    /// Attempts to recover from a request failure. Throwing terminates recovery while preserving
+    /// both this error and the original request error.
+    func attemptRecovery<ResponseBody: Sendable>(
         from error: HTTPRequestPerformerError<ResponseBody>,
-    ) async -> HTTPRequestErrorRecoveryAction<ResponseBody>?
+    ) async throws -> HTTPRequestErrorRecoveryAction<ResponseBody>?
 }
 
-public enum HTTPRequestErrorRecoveryAction<ResponseBody> {
+public enum HTTPRequestErrorRecoveryAction<ResponseBody: Sendable>: Sendable {
+    /// Performs a replacement request after inheriting the failed request's effective environment.
+    /// Values explicitly set on the replacement request take precedence.
     case replaceRequest(HTTPRequestConfiguration<ResponseBody>)
+
     case returnResponse(ResponseBody)
 }
 
@@ -583,17 +705,29 @@ public protocol HTTPBodyModifier<Input, Output>: Sendable {
 
     func modifyBody(
         _ body: Input,
-        request: HTTPRequestConfiguration<Any>,
-        httpRequest: HTTPRequest,
-        response: HTTPResponse,
+        environment: HTTPRequestEnvironmentValues,
+        request: HTTPRequestSnapshot,
+        response: HTTPResponseSnapshot,
     ) async throws -> Output
 }
 
 extension HTTPBodyModifier {
-    public func then<NewOutput>(_ newModifier: any HTTPBodyModifier<Output, NewOutput>) -> some HTTPBodyModifier<Input, NewOutput> {
-        MapHTTPResponseModifier<Input, NewOutput>(transform: { [self] input, request, httpRequest, response in
-            let intermediate = try await self.modifyBody(input, request: request, httpRequest: httpRequest, response: response)
-            return try await newModifier.modifyBody(intermediate, request: request, httpRequest: httpRequest, response: response)
+    public func then<NewOutput>(
+        _ newModifier: any HTTPBodyModifier<Output, NewOutput>,
+    ) -> some HTTPBodyModifier<Input, NewOutput> {
+        MapHTTPResponseModifier<Input, NewOutput>(transform: { [self] input, environment, request, response in
+            let intermediate = try await self.modifyBody(
+                input,
+                environment: environment,
+                request: request,
+                response: response,
+            )
+            return try await newModifier.modifyBody(
+                intermediate,
+                environment: environment,
+                request: request,
+                response: response,
+            )
         })
     }
 }
@@ -601,9 +735,9 @@ extension HTTPBodyModifier {
 public struct MapHTTPResponseModifier<Input, Output>: HTTPBodyModifier {
     public typealias Transform = @Sendable (
         _ input: Input,
-        _ request: HTTPRequestConfiguration<Any>,
-        _ httpRequest: HTTPRequest,
-        _ response: HTTPResponse
+        _ environment: HTTPRequestEnvironmentValues,
+        _ request: HTTPRequestSnapshot,
+        _ response: HTTPResponseSnapshot,
     ) async throws -> Output
 
     private let transform: Transform
@@ -614,24 +748,30 @@ public struct MapHTTPResponseModifier<Input, Output>: HTTPBodyModifier {
 
     public func modifyBody(
         _ body: Input,
-        request: HTTPRequestConfiguration<Any>,
-        httpRequest: HTTPRequest,
-        response: HTTPResponse,
+        environment: HTTPRequestEnvironmentValues,
+        request: HTTPRequestSnapshot,
+        response: HTTPResponseSnapshot,
     ) async throws -> Output {
-        try await transform(body, request, httpRequest, response)
+        try await transform(body, environment, request, response)
     }
 }
 
 extension HTTPRequestConfiguration {
-    public func mapResponseBody<NewResponseBody>(
-        _ transform: @escaping @Sendable (ResponseBody, HTTPRequestConfiguration<Any>, HTTPRequest, HTTPResponse) async throws -> NewResponseBody
+    public func mapResponseBody<NewResponseBody: Sendable>(
+        _ transform: @escaping MapHTTPResponseModifier<ResponseBody, NewResponseBody>.Transform,
     ) -> HTTPRequestConfiguration<NewResponseBody> {
         let newModifier = MapHTTPResponseModifier<ResponseBody, NewResponseBody>(transform: transform)
         return responseBodyModifier(newModifier)
     }
 }
 
-public struct PathRequestModifier: HTTPRequestModifier {
+public enum HTTPRequestURLMutationError: Error {
+    case requestDoesNotHaveURL
+    case failedToCreateURL
+    case failedToEncodePathSegment(String)
+}
+
+public struct RawPathRequestModifier: HTTPRequestModifier {
     public enum Action: Sendable {
         case replace
         case append
@@ -646,7 +786,11 @@ public struct PathRequestModifier: HTTPRequestModifier {
         self.action = action
     }
 
-    public func modifyRequest(_ request: inout HTTPRequest, body: inout Data?) {
+    public func modifyRequest(
+        _ request: inout HTTPRequest,
+        body: inout Data?,
+        environment: HTTPRequestEnvironmentValues,
+    ) {
         switch action {
         case .replace:
             request.path = path
@@ -663,13 +807,107 @@ public struct PathRequestModifier: HTTPRequestModifier {
 }
 
 extension HTTPRequestConfiguration {
-    public func path(
+    /// Sets a raw, already percent-encoded request path.
+    public func rawPath(
         _ path: String,
-        action: PathRequestModifier.Action = .infer,
+        action: RawPathRequestModifier.Action = .infer,
     ) -> Self {
         requestModifier(
-            PathRequestModifier(path: path, action: action)
+            RawPathRequestModifier(path: path, action: action),
         )
+    }
+}
+
+public struct PathSegmentRequestModifier: HTTPRequestModifier {
+    private let segment: String
+
+    public init(segment: String) {
+        self.segment = segment
+    }
+
+    public func modifyRequest(
+        _ request: inout HTTPRequest,
+        body: inout Data?,
+        environment: HTTPRequestEnvironmentValues,
+    ) throws {
+        guard let url = request.url,
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else {
+            throw HTTPRequestURLMutationError.requestDoesNotHaveURL
+        }
+
+        var allowedCharacters = CharacterSet.urlPathAllowed
+        allowedCharacters.remove(charactersIn: "/?#%")
+
+        guard let encodedSegment = segment.addingPercentEncoding(
+            withAllowedCharacters: allowedCharacters,
+        ) else {
+            throw HTTPRequestURLMutationError.failedToEncodePathSegment(segment)
+        }
+
+        var path = components.percentEncodedPath
+        if !path.hasSuffix("/") {
+            path.append("/")
+        }
+        path.append(encodedSegment)
+        components.percentEncodedPath = path
+
+        guard let updatedURL = components.url else {
+            throw HTTPRequestURLMutationError.failedToCreateURL
+        }
+
+        request.url = updatedURL
+    }
+}
+
+public struct QueryItemRequestModifier: HTTPRequestModifier {
+    private let name: String
+    private let value: String?
+
+    public init(name: String, value: String?) {
+        self.name = name
+        self.value = value
+    }
+
+    public func modifyRequest(
+        _ request: inout HTTPRequest,
+        body: inout Data?,
+        environment: HTTPRequestEnvironmentValues,
+    ) throws {
+        guard let url = request.url,
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else {
+            throw HTTPRequestURLMutationError.requestDoesNotHaveURL
+        }
+
+        var queryItems = components.queryItems ?? []
+        queryItems.append(URLQueryItem(name: name, value: value))
+        components.queryItems = queryItems
+
+        guard let updatedURL = components.url else {
+            throw HTTPRequestURLMutationError.failedToCreateURL
+        }
+
+        request.url = updatedURL
+    }
+}
+
+extension HTTPRequestConfiguration {
+    /// Appends and percent-encodes one path segment while preserving the existing query.
+    public func pathSegment(_ segment: String) -> Self {
+        requestModifier(PathSegmentRequestModifier(segment: segment))
+    }
+
+    /// Appends and percent-encodes path segments while preserving the existing query.
+    public func pathSegments(_ segments: String...) -> Self {
+        segments.reduce(self) { request, segment in
+            request.pathSegment(segment)
+        }
+    }
+
+    /// Appends a percent-encoded query item while preserving existing query items.
+    public func queryItem(name: String, value: String?) -> Self {
+        requestModifier(QueryItemRequestModifier(name: name, value: value))
     }
 }
 
@@ -682,7 +920,11 @@ public struct HeaderRequestModifier: HTTPRequestModifier {
         self.value = value
     }
 
-    public func modifyRequest(_ request: inout HTTPRequest, body: inout Data?) {
+    public func modifyRequest(
+        _ request: inout HTTPRequest,
+        body: inout Data?,
+        environment: HTTPRequestEnvironmentValues,
+    ) {
         request.headerFields[name] = value
     }
 }
@@ -693,12 +935,18 @@ extension HTTPRequestConfiguration {
         value: String,
     ) -> Self {
         requestModifier(
-            HeaderRequestModifier(name: name, value: value)
+            HeaderRequestModifier(name: name, value: value),
         )
     }
 }
 
-public struct JSONResponseModifier<ResponseBody: Decodable>: HTTPBodyModifier {
+extension HTTPRequestConfiguration {
+    public func validatingStatusCode() -> Self {
+        responseValidator(HTTPStatusCodeValidator())
+    }
+}
+
+public struct JSONResponseModifier<ResponseBody: Decodable & Sendable>: HTTPBodyModifier {
     public typealias DecoderConfigurator = @Sendable (JSONDecoder) -> Void
 
     private let configureDecoder: DecoderConfigurator
@@ -709,12 +957,12 @@ public struct JSONResponseModifier<ResponseBody: Decodable>: HTTPBodyModifier {
 
     public func modifyBody(
         _ body: Data,
-        request: HTTPRequestConfiguration<Any>,
-        httpRequest: HTTPRequest,
-        response: HTTPResponse,
+        environment: HTTPRequestEnvironmentValues,
+        request: HTTPRequestSnapshot,
+        response: HTTPResponseSnapshot,
     ) throws -> ResponseBody {
         let decoder = JSONDecoder()
-        if let dateDecodingStrategy = request.environmentValues[JSONDateDecodingStrategyKey.self] {
+        if let dateDecodingStrategy = environment.jsonDateDecodingStrategy {
             decoder.dateDecodingStrategy = dateDecodingStrategy
         }
         configureDecoder(decoder)
@@ -723,16 +971,16 @@ public struct JSONResponseModifier<ResponseBody: Decodable>: HTTPBodyModifier {
 }
 
 extension HTTPRequestConfiguration<Data> {
-    public func decodingJSONBody<NewResponseBody: Decodable>(
+    public func decodingJSONBody<NewResponseBody: Decodable & Sendable>(
         ofType responseType: NewResponseBody.Type = NewResponseBody.self,
         configureDecoder: @escaping JSONResponseModifier<NewResponseBody>.DecoderConfigurator = { _ in },
     ) -> HTTPRequestConfiguration<NewResponseBody> {
         responseBodyModifier(
-            JSONResponseModifier(configureDecoder: configureDecoder)
+            JSONResponseModifier(configureDecoder: configureDecoder),
         )
     }
 
-    public func decodingJSONBody<NewResponseBody: Decodable>(
+    public func decodingJSONBody<NewResponseBody: Decodable & Sendable>(
         ofType responseType: NewResponseBody.Type = NewResponseBody.self,
         dateDecodingStrategy: JSONDecoder.DateDecodingStrategy,
         configureDecoder: @escaping JSONResponseModifier<NewResponseBody>.DecoderConfigurator = { _ in },
@@ -741,7 +989,7 @@ extension HTTPRequestConfiguration<Data> {
             JSONResponseModifier(configureDecoder: { decoder in
                 decoder.dateDecodingStrategy = dateDecodingStrategy
                 configureDecoder(decoder)
-            })
+            }),
         )
     }
 }
@@ -758,7 +1006,9 @@ extension HTTPRequestEnvironmentValues {
 }
 
 extension HTTPRequestConfiguration {
-    public func jsonDateDecodingStrategy(_ dateDecodingStrategy: JSONDecoder.DateDecodingStrategy) -> Self {
+    public func jsonDateDecodingStrategy(
+        _ dateDecodingStrategy: JSONDecoder.DateDecodingStrategy,
+    ) -> Self {
         environment(\.jsonDateDecodingStrategy, dateDecodingStrategy)
     }
 }
