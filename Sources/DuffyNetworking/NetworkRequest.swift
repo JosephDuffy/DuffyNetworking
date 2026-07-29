@@ -586,3 +586,45 @@ extension HTTPRequestConfiguration {
         return responseBodyModifier(newModifier)
     }
 }
+
+public struct PathRequestModifier: HTTPRequestModifier {
+    public enum Action: Sendable {
+        case replace
+        case append
+        case infer
+    }
+
+    private let path: String
+    private let action: Action
+
+    public init(path: String, action: Action = .infer) {
+        self.path = path
+        self.action = action
+    }
+
+    public func modifyRequest(_ request: inout HTTPRequest, body: inout Data?) {
+        switch action {
+        case .replace:
+            request.path = path
+        case .append:
+            request.path = "\(request.path ?? "")\(path)"
+        case .infer:
+            if path.hasPrefix("/") {
+                request.path = path
+            } else {
+                request.path = "\(request.path ?? "")\(path)"
+            }
+        }
+    }
+}
+
+extension HTTPRequestConfiguration {
+    public func path(
+        _ path: String,
+        action: PathRequestModifier.Action = .infer,
+    ) -> Self {
+        requestModifier(
+            PathRequestModifier(path: path, action: action)
+        )
+    }
+}
