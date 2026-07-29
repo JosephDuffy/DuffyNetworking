@@ -144,7 +144,7 @@ private struct UnknownMappingError<ResponseBody>: LocalizedError {
 public struct HTTPRequestPerformer: Sendable {
     private let dataProvider: HTTPRequestDataProvider
 
-    private let environment: HTTPRequestEnvironmentValues
+    public let environment: HTTPRequestEnvironmentValues
 
     public init(dataProvider: HTTPRequestDataProvider) {
         self.dataProvider = dataProvider
@@ -168,7 +168,7 @@ public struct HTTPRequestPerformer: Sendable {
         } catch {
             throw HTTPRequestPerformerError(
                 underlyingError: error,
-                requestConfiguration: baseRequest.mapResponseBody({ _, _, _ in
+                requestConfiguration: baseRequest.mapResponseBody({ _, _, _, _ in
                     assertionFailure("Attempted to map the response of a request configuration that was created when a request builder threw an error.")
                     throw UnknownMappingError<ResponseBody>()
                 }),
@@ -278,7 +278,12 @@ public struct HTTPRequestPerformer: Sendable {
 
             let modifiedResponseBody = try await request
                 .responseBodyModifier
-                .modifyBody(responseBody, request: httpRequest, response: httpResponse)
+                .modifyBody(
+                    responseBody,
+                    request: request.mapResponseBody { body, _, _, _ in body as Any },
+                    httpRequest: httpRequest,
+                    response: httpResponse
+                )
 
             notifyResponseListenersOfResponse(
                 .success(
@@ -355,6 +360,8 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
     /// response listener.
     public let errorHandlers: [HTTPRequestPerformerErrorHandler]
 
+    public let environmentValues: HTTPRequestEnvironmentValues
+
     public init(
         baseHTTPRequest: HTTPRequest,
         requestModifiers: [HTTPRequestModifier] = [],
@@ -362,6 +369,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
         responseValidators: [HTTPResponseValidator] = [],
         responseBodyModifier: any HTTPBodyModifier<Data, ResponseBody>,
         errorHandlers: [HTTPRequestPerformerErrorHandler] = [],
+        environmentValues: HTTPRequestEnvironmentValues,
     ) {
         self.baseHTTPRequest = baseHTTPRequest
         self.requestModifiers = requestModifiers
@@ -369,6 +377,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
         self.responseValidators = responseValidators
         self.responseBodyModifier = responseBodyModifier
         self.errorHandlers = errorHandlers
+        self.environmentValues = environmentValues
     }
 
     public init(
@@ -376,8 +385,9 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
         requestModifiers: [HTTPRequestModifier] = [],
         responseListeners: [HTTPResponseListener] = [],
         responseValidators: [HTTPResponseValidator] = [],
-        responseBodyModifier: any HTTPBodyModifier<Data, ResponseBody> = MapHTTPResponseModifier(transform: { body, _, _ in body }),
+        responseBodyModifier: any HTTPBodyModifier<Data, ResponseBody> = MapHTTPResponseModifier(transform: { body, _, _, _ in body }),
         errorHandlers: [HTTPRequestPerformerErrorHandler] = [],
+        environmentValues: HTTPRequestEnvironmentValues,
     ) where ResponseBody == Data {
         self.baseHTTPRequest = baseHTTPRequest
         self.requestModifiers = requestModifiers
@@ -385,6 +395,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
         self.responseValidators = responseValidators
         self.responseBodyModifier = responseBodyModifier
         self.errorHandlers = errorHandlers
+        self.environmentValues = environmentValues
     }
 
     public func requestModifier(
@@ -399,6 +410,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
             responseValidators: responseValidators,
             responseBodyModifier: responseBodyModifier,
             errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
         )
     }
 
@@ -414,6 +426,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
             responseValidators: responseValidators,
             responseBodyModifier: responseBodyModifier,
             errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
         )
     }
 
@@ -429,6 +442,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
             responseValidators: responseValidators,
             responseBodyModifier: responseBodyModifier,
             errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
         )
     }
 
@@ -443,6 +457,7 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
             responseValidators: responseValidators,
             responseBodyModifier: newResponseBodyModifier,
             errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
         )
     }
 
@@ -458,6 +473,24 @@ public struct HTTPRequestConfiguration<ResponseBody>: Sendable {
             responseValidators: responseValidators,
             responseBodyModifier: responseBodyModifier,
             errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
+        )
+    }
+
+    public func environment<V>(
+        _ keyPath: WritableKeyPath<HTTPRequestEnvironmentValues, V>,
+        _ value: V
+    ) -> Self {
+        var environmentValues = environmentValues
+        environmentValues[keyPath: keyPath] = value
+        return HTTPRequestConfiguration<ResponseBody>(
+            baseHTTPRequest: baseHTTPRequest,
+            requestModifiers: requestModifiers,
+            responseListeners: responseListeners,
+            responseValidators: responseValidators,
+            responseBodyModifier: responseBodyModifier,
+            errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
         )
     }
 }
@@ -550,22 +583,28 @@ public protocol HTTPBodyModifier<Input, Output>: Sendable {
 
     func modifyBody(
         _ body: Input,
-        request: HTTPRequest,
+        request: HTTPRequestConfiguration<Any>,
+        httpRequest: HTTPRequest,
         response: HTTPResponse,
     ) async throws -> Output
 }
 
 extension HTTPBodyModifier {
     public func then<NewOutput>(_ newModifier: any HTTPBodyModifier<Output, NewOutput>) -> some HTTPBodyModifier<Input, NewOutput> {
-        MapHTTPResponseModifier<Input, NewOutput>(transform: { [self] input, request, response in
-            let intermediate = try await self.modifyBody(input, request: request, response: response)
-            return try await newModifier.modifyBody(intermediate, request: request, response: response)
+        MapHTTPResponseModifier<Input, NewOutput>(transform: { [self] input, request, httpRequest, response in
+            let intermediate = try await self.modifyBody(input, request: request, httpRequest: httpRequest, response: response)
+            return try await newModifier.modifyBody(intermediate, request: request, httpRequest: httpRequest, response: response)
         })
     }
 }
 
 public struct MapHTTPResponseModifier<Input, Output>: HTTPBodyModifier {
-    public typealias Transform = @Sendable (_ input: Input, _ request: HTTPRequest, _ response: HTTPResponse) async throws -> Output
+    public typealias Transform = @Sendable (
+        _ input: Input,
+        _ request: HTTPRequestConfiguration<Any>,
+        _ httpRequest: HTTPRequest,
+        _ response: HTTPResponse
+    ) async throws -> Output
 
     private let transform: Transform
 
@@ -573,14 +612,19 @@ public struct MapHTTPResponseModifier<Input, Output>: HTTPBodyModifier {
         self.transform = transform
     }
 
-    public func modifyBody(_ body: Input, request: HTTPRequest, response: HTTPResponse) async throws -> Output {
-        try await transform(body, request, response)
+    public func modifyBody(
+        _ body: Input,
+        request: HTTPRequestConfiguration<Any>,
+        httpRequest: HTTPRequest,
+        response: HTTPResponse,
+    ) async throws -> Output {
+        try await transform(body, request, httpRequest, response)
     }
 }
 
 extension HTTPRequestConfiguration {
     public func mapResponseBody<NewResponseBody>(
-        _ transform: @escaping @Sendable (ResponseBody, HTTPRequest, HTTPResponse) async throws -> NewResponseBody
+        _ transform: @escaping @Sendable (ResponseBody, HTTPRequestConfiguration<Any>, HTTPRequest, HTTPResponse) async throws -> NewResponseBody
     ) -> HTTPRequestConfiguration<NewResponseBody> {
         let newModifier = MapHTTPResponseModifier<ResponseBody, NewResponseBody>(transform: transform)
         return responseBodyModifier(newModifier)
@@ -651,5 +695,70 @@ extension HTTPRequestConfiguration {
         requestModifier(
             HeaderRequestModifier(name: name, value: value)
         )
+    }
+}
+
+public struct JSONResponseModifier<ResponseBody: Decodable>: HTTPBodyModifier {
+    public typealias DecoderConfigurator = @Sendable (JSONDecoder) -> Void
+
+    private let configureDecoder: DecoderConfigurator
+
+    public init(configureDecoder: @escaping DecoderConfigurator = { _ in }) {
+        self.configureDecoder = configureDecoder
+    }
+
+    public func modifyBody(
+        _ body: Data,
+        request: HTTPRequestConfiguration<Any>,
+        httpRequest: HTTPRequest,
+        response: HTTPResponse,
+    ) throws -> ResponseBody {
+        let decoder = JSONDecoder()
+        if let dateDecodingStrategy = request.environmentValues[JSONDateDecodingStrategyKey.self] {
+            decoder.dateDecodingStrategy = dateDecodingStrategy
+        }
+        configureDecoder(decoder)
+        return try decoder.decode(ResponseBody.self, from: body)
+    }
+}
+
+extension HTTPRequestConfiguration<Data> {
+    public func decodingJSONBody<NewResponseBody: Decodable>(
+        ofType responseType: NewResponseBody.Type = NewResponseBody.self,
+        configureDecoder: @escaping JSONResponseModifier<NewResponseBody>.DecoderConfigurator = { _ in },
+    ) -> HTTPRequestConfiguration<NewResponseBody> {
+        responseBodyModifier(
+            JSONResponseModifier(configureDecoder: configureDecoder)
+        )
+    }
+
+    public func decodingJSONBody<NewResponseBody: Decodable>(
+        ofType responseType: NewResponseBody.Type = NewResponseBody.self,
+        dateDecodingStrategy: JSONDecoder.DateDecodingStrategy,
+        configureDecoder: @escaping JSONResponseModifier<NewResponseBody>.DecoderConfigurator = { _ in },
+    ) -> HTTPRequestConfiguration<NewResponseBody> {
+        responseBodyModifier(
+            JSONResponseModifier(configureDecoder: { decoder in
+                decoder.dateDecodingStrategy = dateDecodingStrategy
+                configureDecoder(decoder)
+            })
+        )
+    }
+}
+
+private enum JSONDateDecodingStrategyKey: HTTPRequestEnvironmentKey {
+    static let defaultValue: JSONDecoder.DateDecodingStrategy? = nil
+}
+
+extension HTTPRequestEnvironmentValues {
+    public var jsonDateDecodingStrategy: JSONDecoder.DateDecodingStrategy? {
+        get { self[JSONDateDecodingStrategyKey.self] }
+        set { self[JSONDateDecodingStrategyKey.self] = newValue }
+    }
+}
+
+extension HTTPRequestConfiguration {
+    public func jsonDateDecodingStrategy(_ dateDecodingStrategy: JSONDecoder.DateDecodingStrategy) -> Self {
+        environment(\.jsonDateDecodingStrategy, dateDecodingStrategy)
     }
 }
