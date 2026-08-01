@@ -603,11 +603,9 @@ private struct FreshConfigurationRetryHandler: HTTPRequestPerformerErrorHandler 
         let attempt = error.requestConfiguration.environmentValues.retryAttempt
         guard attempt == 0 else { return nil }
 
-        var replacement = HTTPRequestConfiguration<ResponseBody>(
-            baseHTTPRequest: error.requestConfiguration.baseHTTPRequest,
-            responseBodyModifier: error.requestConfiguration.responseBodyModifier,
-        )
-        .environment(\.retryAttempt, attempt + 1)
+        var replacement = error
+            .requestConfiguration
+            .environment(\.retryAttempt, attempt + 1)
 
         if let testValueOverride {
             replacement = replacement.environment(\.testValue, testValueOverride)
