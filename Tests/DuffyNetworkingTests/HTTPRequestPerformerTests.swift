@@ -562,7 +562,6 @@ private actor CountingErrorHandler: HTTPRequestPerformerErrorHandler {
 
     func attemptRecovery<ResponseBody: Sendable>(
         from error: HTTPRequestPerformerError<ResponseBody>,
-        requestPerformer: HTTPRequestPerformer,
     ) -> HTTPRequestErrorRecoveryAction<ResponseBody>? {
         count += 1
         return nil
@@ -574,7 +573,6 @@ private actor EnvironmentRecordingErrorHandler: HTTPRequestPerformerErrorHandler
 
     func attemptRecovery<ResponseBody: Sendable>(
         from error: HTTPRequestPerformerError<ResponseBody>,
-        requestPerformer: HTTPRequestPerformer,
     ) -> HTTPRequestErrorRecoveryAction<ResponseBody>? {
         value = error.requestConfiguration.environmentValues.testValue
         return nil
@@ -586,7 +584,6 @@ private struct EnvironmentRetryHandler: HTTPRequestPerformerErrorHandler {
 
     func attemptRecovery<ResponseBody: Sendable>(
         from error: HTTPRequestPerformerError<ResponseBody>,
-        requestPerformer: HTTPRequestPerformer,
     ) -> HTTPRequestErrorRecoveryAction<ResponseBody>? {
         let attempt = error.requestConfiguration.environmentValues.retryAttempt
         guard attempt < maximumAttempts else { return nil }
@@ -602,7 +599,6 @@ private struct FreshConfigurationRetryHandler: HTTPRequestPerformerErrorHandler 
 
     func attemptRecovery<ResponseBody: Sendable>(
         from error: HTTPRequestPerformerError<ResponseBody>,
-        requestPerformer: HTTPRequestPerformer,
     ) -> HTTPRequestErrorRecoveryAction<ResponseBody>? {
         let attempt = error.requestConfiguration.environmentValues.retryAttempt
         guard attempt == 0 else { return nil }
@@ -622,7 +618,6 @@ private struct FreshConfigurationRetryHandler: HTTPRequestPerformerErrorHandler 
 private struct ThrowingErrorHandler: HTTPRequestPerformerErrorHandler {
     func attemptRecovery<ResponseBody: Sendable>(
         from error: HTTPRequestPerformerError<ResponseBody>,
-        requestPerformer: HTTPRequestPerformer,
     ) throws -> HTTPRequestErrorRecoveryAction<ResponseBody>? {
         throw TestFailure.recovery
     }

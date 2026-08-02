@@ -20,9 +20,10 @@ public struct HTTPRequestPerformer: Sendable {
     public func build<ResponseBody: Sendable>(
         _ requestConfiguration: HTTPRequestConfiguration<ResponseBody>,
     ) async throws(HTTPRequestPerformerError<ResponseBody>) -> HTTPRequestSnapshot {
-        let effectiveEnvironment = environmentValues.merging(
+        var effectiveEnvironment = environmentValues.merging(
             requestConfiguration.environmentValues,
         )
+        effectiveEnvironment.requestPerformer = self
         let request = requestConfiguration.replacingEnvironmentValues(
             with: effectiveEnvironment,
         )
@@ -59,9 +60,10 @@ public struct HTTPRequestPerformer: Sendable {
     public func perform<ResponseBody: Sendable>(
         _ request: HTTPRequestConfiguration<ResponseBody>,
     ) async throws(HTTPRequestPerformerError<ResponseBody>) -> ResponseBody {
-        let effectiveEnvironment = environmentValues.merging(
+        var effectiveEnvironment = environmentValues.merging(
             request.environmentValues,
         )
+        effectiveEnvironment.requestPerformer = self
         let request = request.replacingEnvironmentValues(
             with: effectiveEnvironment,
         )
@@ -113,10 +115,7 @@ public struct HTTPRequestPerformer: Sendable {
                 let recoveryAction: HTTPRequestErrorRecoveryAction<ResponseBody>?
 
                 do {
-                    recoveryAction = try await errorHandler.attemptRecovery(
-                        from: requestError,
-                        requestPerformer: self,
-                    )
+                    recoveryAction = try await errorHandler.attemptRecovery(from: requestError)
                     try Task.checkCancellation()
                 } catch let error as CancellationError {
                     let cancellationError = HTTPRequestPerformerError(
@@ -278,4 +277,9 @@ public struct HTTPRequestPerformer: Sendable {
             environmentValues: environmentValues,
         )
     }
+}
+
+extension HTTPRequestEnvironmentValues {
+    @HTTPRequestEnvironmentEntry
+    public var requestPerformer: HTTPRequestPerformer? = nil
 }

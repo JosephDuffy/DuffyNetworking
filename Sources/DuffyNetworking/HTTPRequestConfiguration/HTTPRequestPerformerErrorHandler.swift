@@ -3,6 +3,5 @@ public protocol HTTPRequestPerformerErrorHandler: Sendable {
     /// both this error and the original request error.
     func attemptRecovery<ResponseBody: Sendable>(
         from error: HTTPRequestPerformerError<ResponseBody>,
-        requestPerformer: HTTPRequestPerformer,
     ) async throws -> HTTPRequestErrorRecoveryAction<ResponseBody>?
 }
