@@ -9,6 +9,10 @@ let package = Package(
             name: "DuffyNetworking",
             targets: ["DuffyNetworking"],
         ),
+        .library(
+            name: "DuffyNetworkingTestSupport",
+            targets: ["DuffyNetworkingTestSupport"],
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-http-types.git", from: "1.6.0"),
@@ -21,9 +25,19 @@ let package = Package(
                 .product(name: "HTTPTypesFoundation", package: "swift-http-types"),
             ],
         ),
+        .target(
+            name: "DuffyNetworkingTestSupport",
+            dependencies: [
+                "DuffyNetworking",
+            ],
+        ),
         .testTarget(
             name: "DuffyNetworkingTests",
-            dependencies: ["DuffyNetworking"],
+            dependencies: [
+                "DuffyNetworking",
+                "DuffyNetworkingTestSupport",
+                .product(name: "HTTPTypes", package: "swift-http-types"),
+            ],
         ),
     ],
     swiftLanguageModes: [.v6]

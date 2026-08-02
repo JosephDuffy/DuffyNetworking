@@ -15,6 +15,12 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     /// These modifiers will be applied in the order they are provided.
     public let requestModifiers: [HTTPRequestModifier]
 
+    /// An array of values that will be notified of the final request.
+    ///
+    /// Listeners are called concurrently in a background task. The request does not wait for the
+    /// request listeners before starting.
+    public let requestListeners: [HTTPRequestListener]
+
     /// An array of values that will be notified of the final result of each performance attempt.
     ///
     /// Listeners for a result are called sequentially in a background task. Request completion does
@@ -49,6 +55,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     public init(
         baseHTTPRequest: HTTPRequest,
         requestModifiers: [HTTPRequestModifier] = [],
+        requestListeners: [HTTPRequestListener] = [],
         responseListeners: [HTTPResponseListener] = [],
         responseValidators: [HTTPResponseValidator] = [],
         responseBodyModifier: any HTTPBodyModifier<Data, ResponseBody>,
@@ -56,6 +63,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     ) {
         self.baseHTTPRequest = baseHTTPRequest
         self.requestModifiers = requestModifiers
+        self.requestListeners = requestListeners
         self.responseListeners = responseListeners
         self.responseValidators = responseValidators
         self.responseBodyModifiers = HTTPBodyModifiers(modifier: responseBodyModifier)
@@ -66,12 +74,14 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     public init(
         baseHTTPRequest: HTTPRequest,
         requestModifiers: [HTTPRequestModifier] = [],
+        requestListeners: [HTTPRequestListener] = [],
         responseListeners: [HTTPResponseListener] = [],
         responseValidators: [HTTPResponseValidator] = [],
         errorHandlers: [HTTPRequestPerformerErrorHandler] = [],
     ) where ResponseBody == Data {
         self.baseHTTPRequest = baseHTTPRequest
         self.requestModifiers = requestModifiers
+        self.requestListeners = requestListeners
         self.responseListeners = responseListeners
         self.responseValidators = responseValidators
         self.responseBodyModifiers = HTTPBodyModifiers()
@@ -82,6 +92,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     private init(
         baseHTTPRequest: HTTPRequest,
         requestModifiers: [HTTPRequestModifier],
+        requestListeners: [HTTPRequestListener],
         responseListeners: [HTTPResponseListener],
         responseValidators: [HTTPResponseValidator],
         responseBodyModifiers: HTTPBodyModifiers<ResponseBody>,
@@ -90,6 +101,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     ) {
         self.baseHTTPRequest = baseHTTPRequest
         self.requestModifiers = requestModifiers
+        self.requestListeners = requestListeners
         self.responseListeners = responseListeners
         self.responseValidators = responseValidators
         self.responseBodyModifiers = responseBodyModifiers
@@ -105,6 +117,24 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
         return HTTPRequestConfiguration<ResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
+            responseListeners: responseListeners,
+            responseValidators: responseValidators,
+            responseBodyModifiers: responseBodyModifiers,
+            errorHandlers: errorHandlers,
+            environmentValues: environmentValues,
+        )
+    }
+
+    public func requestListener(
+        _ requestListener: HTTPRequestListener,
+    ) -> Self {
+        var requestListeners = requestListeners
+        requestListeners.append(requestListener)
+        return HTTPRequestConfiguration<ResponseBody>(
+            baseHTTPRequest: baseHTTPRequest,
+            requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
             responseListeners: responseListeners,
             responseValidators: responseValidators,
             responseBodyModifiers: responseBodyModifiers,
@@ -121,6 +151,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
         return HTTPRequestConfiguration<ResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
             responseListeners: responseListeners,
             responseValidators: responseValidators,
             responseBodyModifiers: responseBodyModifiers,
@@ -137,6 +168,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
         return HTTPRequestConfiguration<ResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
             responseListeners: responseListeners,
             responseValidators: responseValidators,
             responseBodyModifiers: responseBodyModifiers,
@@ -154,6 +186,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
         return HTTPRequestConfiguration<NewResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
             responseListeners: responseListeners,
             responseValidators: responseValidators,
             responseBodyModifiers: newResponseBodyModifiers,
@@ -170,6 +203,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
         return HTTPRequestConfiguration<ResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
             responseListeners: responseListeners,
             responseValidators: responseValidators,
             responseBodyModifiers: responseBodyModifiers,
@@ -187,6 +221,7 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
         return HTTPRequestConfiguration<ResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
             responseListeners: responseListeners,
             responseValidators: responseValidators,
             responseBodyModifiers: responseBodyModifiers,
@@ -195,12 +230,24 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
         )
     }
 
+    @inline(__always)
+    public func debugOnly<NewResponseBody: Sendable>(
+        _ transform: (_ requestConfiguration: Self) -> HTTPRequestConfiguration<NewResponseBody>,
+    ) -> HTTPRequestConfiguration<NewResponseBody> {
+        #if DEBUG
+        transform(self)
+        #else
+        self
+        #endif
+    }
+
     internal func replacingEnvironmentValues(
         with environmentValues: HTTPRequestEnvironmentValues,
     ) -> Self {
         HTTPRequestConfiguration<ResponseBody>(
             baseHTTPRequest: baseHTTPRequest,
             requestModifiers: requestModifiers,
+            requestListeners: requestListeners,
             responseListeners: responseListeners,
             responseValidators: responseValidators,
             responseBodyModifiers: responseBodyModifiers,

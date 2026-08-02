@@ -18,6 +18,43 @@ public struct HTTPRequestPerformer: Sendable {
         self.environmentValues = environmentValues
     }
 
+    public func build<ResponseBody: Sendable>(
+        _ requestConfiguration: HTTPRequestConfiguration<ResponseBody>,
+    ) async throws(HTTPRequestPerformerError<ResponseBody>) -> HTTPRequestSnapshot {
+        let effectiveEnvironment = environmentValues.merging(
+            requestConfiguration.environmentValues,
+        )
+        let request = requestConfiguration.replacingEnvironmentValues(
+            with: effectiveEnvironment,
+        )
+
+        var httpRequest = request.baseHTTPRequest
+        var requestBody: Data?
+
+        do {
+            for modifier in request.requestModifiers {
+                try await modifier.modifyRequest(
+                    &httpRequest,
+                    body: &requestBody,
+                    environment: effectiveEnvironment,
+                )
+                try Task.checkCancellation()
+            }
+        } catch {
+            throw HTTPRequestPerformerError(
+                underlyingError: error,
+                requestConfiguration: request,
+                request: nil,
+                response: nil,
+            )
+        }
+
+        return HTTPRequestSnapshot(
+            body: requestBody,
+            request: httpRequest,
+        )
+    }
+
     /// Performs a request after merging the performer's environment defaults with the request's
     /// overrides. Request values take precedence, and the supplied configuration is not mutated.
     public func perform<ResponseBody: Sendable>(
@@ -152,6 +189,14 @@ public struct HTTPRequestPerformer: Sendable {
             body: requestBody,
             request: httpRequest,
         )
+
+        if !request.requestListeners.isEmpty {
+            Task(priority: .background) { @concurrent in
+                for requestListener in request.requestListeners {
+                    await requestListener.handleRequest(requestSnapshot, configuration: request)
+                }
+            }
+        }
         let responseSnapshot: HTTPResponseSnapshot
 
         do {
