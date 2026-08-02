@@ -4,7 +4,6 @@ import FoundationEssentials
 import Foundation
 #endif
 
-@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 public struct HTTPRequestPerformer: Sendable {
     private let dataProvider: HTTPRequestDataProvider
 
@@ -73,7 +72,7 @@ public struct HTTPRequestPerformer: Sendable {
             guard !request.responseListeners.isEmpty else { return }
 
             let response = response()
-            Task(priority: .low) { @concurrent [responseListeners = request.responseListeners] in
+            Task(priority: .background) { @concurrent [responseListeners = request.responseListeners] in
                 for responseListener in responseListeners {
                     await responseListener.handleResponse(response)
                 }
