@@ -5,15 +5,9 @@ import Foundation
 #endif
 import HTTPTypes
 
-private enum SensitiveHTTPRequestValuesKey: HTTPRequestEnvironmentKey {
-    static let defaultValue: Set<String> = []
-}
-
 extension HTTPRequestEnvironmentValues {
-    public var sensitiveRequestValues: Set<String> {
-        get { self[SensitiveHTTPRequestValuesKey.self] }
-        set { self[SensitiveHTTPRequestValuesKey.self] = newValue }
-    }
+    @HTTPRequestEnvironmentEntry
+    public var sensitiveRequestValues: Set<String> = []
 }
 
 private enum SensitiveHTTPRequestHeadersKey: HTTPRequestEnvironmentKey {
@@ -26,21 +20,18 @@ private enum SensitiveHTTPRequestHeadersKey: HTTPRequestEnvironmentKey {
 }
 
 extension HTTPRequestEnvironmentValues {
-    public var sensitiveRequestHeaders: Set<HTTPField.Name> {
-        get { self[SensitiveHTTPRequestHeadersKey.self] }
-        set { self[SensitiveHTTPRequestHeadersKey.self] = newValue }
-    }
-}
-
-private enum InsensitiveHTTPCookieNamesKey: HTTPRequestEnvironmentKey {
-    static let defaultValue: Set<String> = []
+    @HTTPRequestEnvironmentEntry
+    public var sensitiveRequestHeaders: Set<HTTPField.Name> = [
+        .authorization,
+        .wwwAuthenticate,
+        .cookie,
+        .proxyAuthorization,
+    ]
 }
 
 extension HTTPRequestEnvironmentValues {
-    public var insensitiveCookieNames: Set<String> {
-        get { self[InsensitiveHTTPCookieNamesKey.self] }
-        set { self[InsensitiveHTTPCookieNamesKey.self] = newValue }
-    }
+    @HTTPRequestEnvironmentEntry
+    public var insensitiveCookieNames: Set<String> = []
 }
 
 public struct CurlLoggerRequestListener: HTTPRequestListener {

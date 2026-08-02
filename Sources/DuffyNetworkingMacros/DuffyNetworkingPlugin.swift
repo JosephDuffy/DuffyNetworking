@@ -5,5 +5,6 @@ import SwiftSyntaxMacros
 struct DuffyNetworkingPlugin: CompilerPlugin {
     let providingMacros: [Macro.Type] = [
         APIClientMacro.self,
+        HTTPRequestEnvironmentEntryMacro.self,
     ]
 }

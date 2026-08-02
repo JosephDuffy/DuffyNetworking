@@ -52,15 +52,9 @@ extension HTTPRequestConfiguration<Data> {
     }
 }
 
-private enum JSONDateDecodingStrategyKey: HTTPRequestEnvironmentKey {
-    static let defaultValue: JSONDecoder.DateDecodingStrategy? = nil
-}
-
 extension HTTPRequestEnvironmentValues {
-    public var jsonDateDecodingStrategy: JSONDecoder.DateDecodingStrategy? {
-        get { self[JSONDateDecodingStrategyKey.self] }
-        set { self[JSONDateDecodingStrategyKey.self] = newValue }
-    }
+    @HTTPRequestEnvironmentEntry
+    public var jsonDateDecodingStrategy: JSONDecoder.DateDecodingStrategy? = nil
 }
 
 extension HTTPRequestConfiguration {
