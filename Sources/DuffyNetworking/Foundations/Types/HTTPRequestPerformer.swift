@@ -113,7 +113,10 @@ public struct HTTPRequestPerformer: Sendable {
                 let recoveryAction: HTTPRequestErrorRecoveryAction<ResponseBody>?
 
                 do {
-                    recoveryAction = try await errorHandler.attemptRecovery(from: requestError)
+                    recoveryAction = try await errorHandler.attemptRecovery(
+                        from: requestError,
+                        requestPerformer: self,
+                    )
                     try Task.checkCancellation()
                 } catch let error as CancellationError {
                     let cancellationError = HTTPRequestPerformerError(
