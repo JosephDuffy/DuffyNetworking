@@ -231,9 +231,9 @@ public struct HTTPRequestConfiguration<ResponseBody: Sendable>: Sendable {
     }
 
     @inline(__always)
-    public func debugOnly<NewResponseBody: Sendable>(
-        _ transform: (_ requestConfiguration: Self) -> HTTPRequestConfiguration<NewResponseBody>,
-    ) -> HTTPRequestConfiguration<NewResponseBody> {
+    public func debugOnly(
+        _ transform: (_ requestConfiguration: Self) -> Self,
+    ) -> Self {
         #if DEBUG
         transform(self)
         #else
